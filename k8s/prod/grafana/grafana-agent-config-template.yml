@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-agent-config
+  namespace: grafana-agent
+data:
+  agent.yaml: |
+    server:
+      log_level: info
+
+    metrics:
+      global:
+        scrape_interval: 15s
+      configs:
+        - name: k8s
+          remote_write:
+            - url: $PROMETHEUS_URL
+              basic_auth:
+                username: $PROMETHEUS_USER
+                password: $PROM_API_KEY
+          scrape_configs:
+            - job_name: 'kubernetes-pods'
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_name]
+                  action: replace
+                  target_label: pod_name
+
+    logs:
+      configs:
+        - name: k8s-logs
+          clients:
+            - url: $LOKI_URL
+              basic_auth:
+                username: $LOKI_USER
+                password: $LOKI_API_KEY
+          positions:
+            filename: /tmp/positions.yaml
+          scrape_configs:
+            - job_name: varlogs
+              static_configs:
+                - targets: []
+                  labels:
+                    job: varlogs
+                    __path__: /var/log/containers/*.log
