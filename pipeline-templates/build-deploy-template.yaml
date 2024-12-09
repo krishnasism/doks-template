@@ -1,0 +1,121 @@
+name: build-push-deploy
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend_app/**"
+      - "celery_worker/**"
+      - "frontend/**"
+      - "k8s/**"
+      - ".github/workflows/build-deploy.yml"
+      - "terraform/**"
+      - "Makefile"
+
+env:
+  DIGITALOCEAN_TOKEN: ${{secrets.DIGITALOCEAN_TOKEN}}
+  AUTH0_API_AUDIENCE: ${{secrets.AUTH0_API_AUDIENCE}}
+  AUTH0_CLIENT_SECRET: ${{secrets.AUTH0_CLIENT_SECRET}}
+  AUTH0_DOMAIN: ${{vars.AUTH0_DOMAIN}}
+  AUTH0_CLIENT_ID: ${{vars.AUTH0_CLIENT_ID}}
+  AWS_ACCESS_KEY_ID: ${{secrets.AWS_ACCESS_KEY_ID}}
+  AWS_SECRET_ACCESS_KEY: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+  AWS_REGION: ${{vars.AWS_REGION}}
+  OPENAI_TOKEN: ${{secrets.OPENAI_TOKEN}}
+  CELERY_BROKER_URL: ${{secrets.CELERY_BROKER_URL}}
+  CELERY_BACKEND_URL: ${{secrets.CELERY_BACKEND_URL}}
+  MONGO_INITDB_ROOT_USERNAME: ${{secrets.MONGO_INITDB_ROOT_USERNAME}}
+  MONGO_INITDB_ROOT_PASSWORD: ${{secrets.MONGO_INITDB_ROOT_PASSWORD}}
+  MONGODB_DB_NAME: ${{vars.MONGODB_DB_NAME}}
+
+  # Terraform variables
+  TF_VAR_auth0_cname_verification_record: ${{secrets.AUTH0_CNAME_VERIFICATION_RECORD}}
+  TF_VAR_zoho_mail_txt_verification_record: ${{secrets.ZOHO_MAIL_TXT_VERIFICATION_RECORD}}
+  TF_VAR_zoho_mail_domain_key: ${{secrets.ZOHO_MAIL_DOMAIN_KEY}}
+  TF_VAR_ses_dkim1: ${{secrets.SES_DKIM1}}
+  TF_VAR_ses_dkim2: ${{secrets.SES_DKIM2}}
+  TF_VAR_ses_dkim3: ${{secrets.SES_DKIM3}}
+
+  # Monitoring - Grafana
+  LOKI_API_KEY: ${{secrets.LOKI_API_KEY}}
+  PROM_API_KEY: ${{secrets.PROM_API_KEY}}
+  PROMETHEUS_URL: ${{secrets.PROMETHEUS_URL}}
+  PROMETHEUS_USER: ${{secrets.PROMETHEUS_USER}}
+  LOKI_URL: ${{secrets.LOKI_URL}}
+  LOKI_USER: ${{secrets.LOKI_USER}}
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY_NAME: template
+      REPOSITORY_NAME: template
+      BACKEND_REPOSITORY_NAME: template
+      FRONTEND_REPOSITORY_NAME: template_frontend
+      CELERY_REPOSITORY_NAME: celery_worker
+      CLUSTER_NAME: template
+      DEPLOYMENT_NAME: template
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{env.DIGITALOCEAN_TOKEN}}
+
+      # Terraform Steps
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Initialize Terraform
+        run: make init
+        working-directory: ./terraform
+
+      - name: Terraform Plan
+        run: make plan ARGS='-out=tfplan'
+        working-directory: ./terraform
+
+      - name: Terraform Apply
+        if: github.event_name == 'push'
+        run: make apply ARGS='-auto-approve tfplan'
+        working-directory: ./terraform
+
+      - name: Permissions for cluster
+        if: github.event_name == 'push'
+        run: doctl kubernetes cluster registry add template
+
+      - name: Log in to DigitalOcean Container Registry with short-lived credentials
+        run: doctl registry login --expiry-seconds 1200
+
+      # Build and Push image to registry - Backend
+      - name: Build backend container image
+        run: docker build -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/${{ env.BACKEND_REPOSITORY_NAME }}:$(echo $GITHUB_SHA | head -c7) .
+        working-directory: ./backend_app
+
+      - name: Push backend image to DigitalOcean Container Registry
+        run: docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/${{ env.BACKEND_REPOSITORY_NAME }}:$(echo $GITHUB_SHA | head -c7)
+
+      # Build and Push image to registry - Frontend
+      - name: Build frontend container image
+        run: docker build -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/${{ env.FRONTEND_REPOSITORY_NAME }}:$(echo $GITHUB_SHA | head -c7) .
+        working-directory: ./frontend
+
+      - name: Push frontend image to DigitalOcean Container Registry
+        run: docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/${{ env.FRONTEND_REPOSITORY_NAME }}:$(echo $GITHUB_SHA | head -c7)
+
+      # Build and Push image to registry - Celery
+      - name: Build celery container image
+        run: docker build -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/${{ env.CELERY_REPOSITORY_NAME }}:$(echo $GITHUB_SHA | head -c7) .
+        working-directory: ./celery_worker
+
+      - name: Push celery worker image to DigitalOcean Container Registry
+        run: docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/${{ env.CELERY_REPOSITORY_NAME }}:$(echo $GITHUB_SHA | head -c7)
+
+      - name: Save DigitalOcean kubeconfig with short-lived credentials
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 600 ${{ env.CLUSTER_NAME }}
+
+      - name: Deploy to DigitalOcean Kubernetes
+        run: make deploy
